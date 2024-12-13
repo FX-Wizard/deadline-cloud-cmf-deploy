@@ -1,0 +1,151 @@
+# Copied from https://docs.aws.amazon.com/deadline-cloud/latest/userguide/create-auto-scaling.html
+Resources:
+  AutoScalingLambda:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      Code:
+        ZipFile: |-
+          """
+          This lambda is configured to handle "Fleet Size Recommendation Change"
+          messages. It will handle all such events, and requires
+          that the ASG is named based on the fleet id. It will scale up/down the fleet
+          based on the recommended fleet size in the message.
+          
+          Example EventBridge message:
+          {
+              "version": "0",
+              "id": "6a7e8feb-b491-4cf7-a9f1-bf3703467718",
+              "detail-type": "Fleet Size Recommendation Change",
+              "source": "aws.deadline",
+              "account": "111122223333",
+              "time": "2017-12-22T18:43:48Z",
+              "region": "us-west-1",
+              "resources": [],
+              "detail": {
+                  "farmId": "farm-12345678900000000000000000000000",
+                  "fleetId": "fleet-12345678900000000000000000000000",
+                  "oldFleetSize": 1,
+                  "newFleetSize": 5,
+              }
+          }
+          """
+          
+          import json
+          import boto3
+          import logging
+
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          auto_scaling_client = boto3.client("autoscaling")
+
+          def lambda_handler(event, context):
+              logger.info(event)
+              event_detail = event["detail"]
+              fleet_id = event_detail["fleetId"]
+              desired_capacity = event_detail["newFleetSize"]
+
+              asg_name = f"deadline-ASG-autoscalable-{fleet_id}"
+              auto_scaling_client.set_desired_capacity(
+                  AutoScalingGroupName=asg_name,
+                  DesiredCapacity=desired_capacity,
+                  HonorCooldown=False,
+              )
+
+              return {
+                  'statusCode': 200,
+                  'body': json.dumps(f'Successfully set desired_capacity for {asg_name} to {desired_capacity}')
+              }
+      Handler: index.lambda_handler
+      Role: !GetAtt 
+        - AutoScalingLambdaServiceRole
+        - Arn
+      Runtime: python3.11
+    DependsOn:
+      - AutoScalingLambdaServiceRoleDefaultPolicy
+      - AutoScalingLambdaServiceRole
+  AutoScalingEventRule:
+    Type: 'AWS::Events::Rule'
+    Properties:
+      EventPattern:
+        source:
+          - aws.deadline
+        detail-type:
+          - Fleet Size Recommendation Change
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt 
+            - AutoScalingLambda
+            - Arn
+          DeadLetterConfig:
+            Arn: !GetAtt 
+              - UnprocessedAutoScalingEventQueue
+              - Arn
+          Id: Target0
+          RetryPolicy:
+            MaximumRetryAttempts: 15
+  AutoScalingEventRuleTargetPermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !GetAtt 
+        - AutoScalingLambda
+        - Arn
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt 
+        - AutoScalingEventRule
+        - Arn
+  AutoScalingLambdaServiceRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action: 'sts:AssumeRole'
+            Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+        Version: 2012-10-17
+      ManagedPolicyArns:
+        - !Join 
+          - ''
+          - - 'arn:'
+            - !Ref 'AWS::Partition'
+            - ':iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+  AutoScalingLambdaServiceRoleDefaultPolicy:
+    Type: 'AWS::IAM::Policy'
+    Properties:
+      PolicyDocument:
+        Statement:
+          - Action: 'autoscaling:SetDesiredCapacity'
+            Effect: Allow
+            Resource: '*'
+        Version: 2012-10-17
+      PolicyName: AutoScalingLambdaServiceRoleDefaultPolicy
+      Roles:
+        - !Ref AutoScalingLambdaServiceRole
+  UnprocessedAutoScalingEventQueue:
+    Type: 'AWS::SQS::Queue'
+    Properties:
+      QueueName: deadline-unprocessed-autoscaling-events
+    UpdateReplacePolicy: Delete
+    DeletionPolicy: Delete
+  UnprocessedAutoScalingEventQueuePolicy:
+    Type: 'AWS::SQS::QueuePolicy'
+    Properties:
+      PolicyDocument:
+        Statement:
+          - Action: 'sqs:SendMessage'
+            Condition:
+              ArnEquals:
+                'aws:SourceArn': !GetAtt 
+                  - AutoScalingEventRule
+                  - Arn
+            Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Resource: !GetAtt 
+              - UnprocessedAutoScalingEventQueue
+              - Arn
+        Version: 2012-10-17
+      Queues:
+        - !Ref UnprocessedAutoScalingEventQueue

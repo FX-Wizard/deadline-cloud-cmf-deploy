@@ -1,0 +1,117 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Deploy Deadline Cloud customer managed fleet (CMF) into existing render farm.
+
+Parameters:
+  NamePrefix:
+    Type: String
+    Description: A prefix for naming resources
+  FarmId:
+    Type: String
+    Description: ID of the render farm.
+  OperatingSystem:
+    Type: String
+    Description: The operating system of the render farm.
+    Default: "LINUX"
+    AllowedValues:
+      - "LINUX"
+      - "WINDOWS"
+  MaxWorkerCount:
+    Type: Number
+    Description: The maximum number of workers in the fleet.
+    Default: 10
+    MinValue: 1
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Basic Settings"
+        Parameters:
+          - NamePrefix
+      - Label:
+          default: "Render Farm Settings"
+        Parameters:
+          - FarmId
+      - Label:
+          default: "Render Worker Settings"
+        Parameters:
+          - OperatingSystem
+          - MaxWorkerCount
+    ParameterLabels:
+      NamePrefix:
+        default: "Name prefix"
+      FarmId:
+        default: "Render farm ID"
+      OperatingSystem:
+        default: "Operating system"
+      MaxWorkerCount:
+        default: "Maximum worker count"
+
+Resources:
+  DeadlineFleetRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - 'sts:AssumeRole'
+            Principal:
+              Service:
+                - credentials.deadline.amazonaws.com
+            Condition:
+              StringEquals:
+                "aws:SourceAccount": !Sub "${AWS::AccountId}"
+      Policies:
+        - PolicyName: DeadlineFleetWorkerPolicy
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Action:
+                  - deadline:AssumeFleetRoleForWorker
+                  - deadline:AssumeQueueRoleForWorker
+                  - deadline:BatchGetJobEntity
+                  - deadline:DeleteWorker
+                  - deadline:UpdateWorker
+                  - deadline:UpdateWorkerSchedule
+                Condition:
+                  StringEquals:
+                    "aws:PrincipalAccount": !Sub "${AWS::AccountId}"
+                Effect: Allow
+                Resource: "*"
+              - Action:
+                  - logs:CreateLogStream
+                  - logs:GetLogEvents
+                  - logs:PutLogEvents
+                Effect: Allow
+                Condition:
+                  StringEquals:
+                    "aws:PrincipalAccount": !Sub "${AWS::AccountId}"
+                Resource: "arn:aws:logs:*:*:*:/aws/deadline/*"
+      Tags:
+        - Key: Name
+          Value: !Sub "${NamePrefix}-DeadlineFleetRole"
+
+  CustomerManagedFleet:
+    Type: AWS::Deadline::Fleet
+    Properties:
+      Configuration:
+        CustomerManaged:
+          Mode: EVENT_BASED_AUTO_SCALING
+          WorkerCapabilities:
+            CpuArchitectureType: x86_64
+            MemoryMiB:
+              Min: 16384
+            OsFamily: !Ref OperatingSystem
+            VCpuCount:
+              Min: 4
+      DisplayName: !Ref NamePrefix
+      FarmId: !Ref FarmId
+      MaxWorkerCount: !Ref MaxWorkerCount
+      RoleArn: !GetAtt DeadlineFleetRole.Arn
+
+Outputs:
+  FleetId:
+    Description: The ID of the Deadline customer managed fleet
+    Value: !GetAtt CustomerManagedFleet.FleetId

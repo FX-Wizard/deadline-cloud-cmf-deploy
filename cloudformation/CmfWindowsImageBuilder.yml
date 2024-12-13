@@ -1,0 +1,368 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Create Deadline Cloud worker image for customer managed fleet (CMF) using imagebuilder.
+
+Parameters:
+  NamePrefix:
+    Type: String
+    Description: A prefix for naming resources
+  FarmId:
+    Type: String
+    Description: ID of the render farm.
+  FleetId:
+    Type: String
+    Description: ID of the Deadline customer managed fleet.
+  InstanceTypes:
+    Type: CommaDelimitedList
+    Description: "A comma separated list of instance types to be used by Image Builder to create the image. For example: 'g4dn.xlarge,m5a.large'"
+    Default: "c6a.xlarge,c6.xlarge"
+  Vpc:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC to launch the Image Builder instance in.
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Subnet to run Image Builder instance.
+  SecurityGroupIds:
+    Type: List<AWS::EC2::SecurityGroup::Id>
+    Description: Security group with the required inbound and outbound rules to allow Image Builder to access resources in the VPC
+  InstallBlender:
+    Type: String
+    Description: Install Blender 4.2.4 on Deadline Worker Image
+    Default: "No"
+    AllowedValues:
+      - "Yes"
+      - "No"
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Basic Settings"
+        Parameters:
+          - NamePrefix
+      - Label:
+          default: "Render Farm Settings"
+        Parameters:
+          - FarmId
+          - FleetId
+          - InstallBlender
+      - Label:
+          default: "Image Builder Settings"
+        Parameters:
+          - Vpc
+          - Subnet
+          - SecurityGroup
+          - InstanceTypes
+    ParameterLabels:
+      NamePrefix:
+        default: "Name Prefix"
+      FarmId:
+        default: "Render Farm ID"
+      FleetId:
+        default: "Fleet ID"
+      InstanceTypes:
+        default: "Instance Types"
+      Vpc:
+        default: "VPC"
+      Subnet:
+        default: "Subnet"
+      SecurityGroup:
+        default: "Security Group"
+      InstallBlender:
+        default: "Install Blender"
+
+Conditions:
+  ShouldInstallBlender: !Equals 
+    - !Ref InstallBlender
+    - "true"
+
+Resources:
+  ImageBuilderRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/EC2InstanceProfileForImageBuilder
+
+  ImageBuilderInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub "${NamePrefix}-ImageBuilderInstanceProfile"
+      Roles:
+        - !Ref ImageBuilderRole
+
+  DeadlineWorkerInfraConfig:
+    Type: AWS::ImageBuilder::InfrastructureConfiguration
+    Properties:
+      Name: !Sub "${NamePrefix}-deadline-cmf-infra-config"
+      InstanceTypes: !Ref InstanceTypes
+      InstanceProfileName: !Ref ImageBuilderInstanceProfile
+      SubnetId: !Select [0, !Ref SubnetIds]
+      SecurityGroupIds: !Ref SecurityGroupIds
+      TerminateInstanceOnFailure: true
+
+  PythonComponentWindows:
+    Type: AWS::ImageBuilder::Component
+    Properties:
+      Name: python-component-windows
+      Platform: Windows
+      Version: 1.0.0
+      Data: |
+        name: Python Component
+        description: Installs Python 3
+        schemaVersion: 1.0
+        phases:
+          - name: build
+            steps:
+              - name: DownloadAndInstallPython
+                action: ExecutePowerShell
+                inputs:
+                  commands:
+                    - |
+                      $pythonVersion = "3.11.0"
+                      $pythonDownloadUrl = "https://www.python.org/ftp/python/$pythonVersion/python-$pythonVersion-amd64.exe"
+                      $installDir = "C:\Python"
+                      Invoke-WebRequest -Uri $pythonDownloadUrl -OutFile "$env:TEMP\python-installer.exe"
+                      Start-Process -FilePath "$env:TEMP\python-installer.exe" -ArgumentList "/quiet", "InstallAllUsers=1", "PrependPath=1", "DefaultCustomInstall=1", "DefaultPath=$installDir" -Wait
+                      Remove-Item "$env:TEMP\python-installer.exe" -Force
+              - name: VerifyPythonInstall
+                action: ExecutePowerShell
+                inputs:
+                  commands:
+                    - |
+                      $pythonVersion = python --version
+                      if (-not $?) {
+                          Write-Error "Python is not installed or not in PATH"
+                          exit 1
+                      }
+                      Write-Host "Python version: $pythonVersion"
+              - name: VerifyPipInstall
+                action: ExecutePowerShell
+                inputs:
+                  commands:
+                    - |
+                      $pipVersion = pip --version
+                      if (-not $?) {
+                          Write-Error "pip is not installed or not in PATH"
+                          exit 1
+                      }
+                      Write-Host "pip version: $pipVersion"
+  
+  DeadlineComponentWindows:
+    Type: AWS::ImageBuilder::Component
+    Properties:
+      Name: deadline-installation-windows
+      Platform: Windows
+      Version: 1.0.0
+      Data: |
+        name: Deadline Installation Component
+        description: Installs Deadline Worker
+        schemaVersion: 1.0
+        phases:
+          - name: build
+            steps:
+              - name: DownloadAndInstallDeadline
+                action: ExecutePowerShell
+                inputs:
+                  commands:
+                    - python -m pip install deadline-cloud-worker-agent
+
+  DeadlineConfigComponentWindows:
+    Type: AWS::ImageBuilder::Component
+    Properties:
+      Name: deadline-config
+      Platform: Windows
+      Version: 1.0.0
+      Data: !Sub |
+        name: Deadline Config Component
+        description: Configures Deadline Worker
+        schemaVersion: 1.0
+        phases:
+          - name: build
+            steps:
+              - name: ConfigureDeadline
+                action: ExecutePowerShell
+                inputs:
+                  commands:
+                    - install-deadline-worker --farm-id ${FarmId} --fleet-id ${FleetId} --region ${AWS::Region} --allow-shutdown --yes
+              - name: AutostartDeadlineService
+                action: ExecutePowerShell
+                inputs:
+                  commands:
+                    - cmd /C "sc.exe config DeadlineWorker start= auto"
+
+  BlenderComponentWindows:
+    Type: AWS::ImageBuilder::Component
+    Properties:
+      Name: blender-installation-windows
+      Platform: Windows
+      Version: 1.0.0
+      Data: |
+        name: Blender Installation Component
+        description: Downloads and installs Blender
+        schemaVersion: 1.0
+        phases:
+          - name: build
+            steps:
+              - name: DownloadAndInstallBlender
+                action: ExecutePowerShell
+                inputs:
+                  commands:
+                    - |
+                      $blenderVersion = "4.2.4"
+                      $downloadUrl = "https://download.blender.org/release/Blender$blenderVersion/blender-$blenderVersion-windows-x64.msi"
+                      $installerPath = "$env:TEMP\blender-installer.msi"
+                      
+                      Write-Host "Downloading Blender..."
+                      Invoke-WebRequest -Uri $downloadUrl -OutFile $installerPath
+                      
+                      Write-Host "Installing Blender..."
+                      Start-Process msiexec.exe -ArgumentList "/i `"$installerPath`" /quiet /norestart" -Wait
+                      
+                      Write-Host "Cleaning up..."
+                      Remove-Item $installerPath -Force
+                      
+                      # Verify installation
+                      $blenderPath = "${env:ProgramFiles}\Blender Foundation\Blender $blenderVersion\blender.exe"
+                      if (Test-Path $blenderPath) {
+                          Write-Host "Blender installation successful"
+                      } else {
+                          Write-Error "Blender installation failed"
+                          exit 1
+                      }
+
+  DeadlineAdaptorBlenderInstallComponent:
+    Type: AWS::ImageBuilder::Component
+    Properties:
+      Name: deadline-adaptor-blender-install-component
+      Platform: Windows
+      Version: 1.0.0
+      Data: !Sub |
+        name: Deadline Adaptor Blender Install Component
+        description: Installs Deadline Adaptor for Blender
+        schemaVersion: 1.0
+        phases:
+          - name: build
+            steps:
+              - name: InstallDeadlineAdaptorBlender
+                action: ExecutePowerShell
+                inputs:
+                  commands:
+                    - pip install deadline-cloud-for-blender
+
+  DeadlineAdaptor3dsmaxInstallComponent:
+    Type: AWS::ImageBuilder::Component
+    Properties:
+      Name: deadline-adaptor-3dsmax-install-component
+      Platform: Windows
+      Version: 1.0.0
+      Data: !Sub |
+        name: Deadline Adaptor 3ds Max Install Component
+        description: Installs Deadline Adaptor for 3ds Max
+        schemaVersion: 1.0
+        phases:
+          - name: build
+            steps:
+              - name: InstallDeadlineAdaptor3dsMax
+                action: ExecutePowerShell
+                inputs:
+                  commands:
+                    - pip install deadline-cloud-for-3ds-max
+
+  GeneratedPassword:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub "${NamePrefix}-render-user-password"
+      Description: "Password for render job user"
+      GenerateSecretString:
+        PasswordLength: 20
+        ExcludeCharacters: '"@/\\'  # Exclude problematic characters
+        ExcludePunctuation: true
+        RequireEachIncludedType: true  # Require all character types
+        IncludeSpace: false
+        SecretStringTemplate: '{"username": "renderuser"}'  # Include additional fields
+        GenerateStringKey: "password"  # Key name for the generated password
+
+  CreateRenderUserComponentWindows:
+    Type: AWS::ImageBuilder::Component
+    Properties:
+      Name: render-job-user
+      Platform: Windows
+      Version: 1.0.0
+      Data: !Sub |
+        name: Create Render Job User
+        description: Creates new user account for Deadline Cloud to run render jobs as
+        schemaVersion: 1.0
+        phases:
+          - name: build
+            steps:
+              - name: ConfigureDeadline
+                action: ExecutePowerShell
+                inputs:
+                  commands:
+                    - |
+                        $Password = ConvertTo-SecureString '{{resolve:secretsmanager:${GeneratedPassword}:SecretString:password}}' -AsPlainText -Force
+                        $UserName = "renderuser"
+                        New-LocalUser -Name $UserName -Password $Password -PasswordNeverExpires
+                        Add-LocalGroupMember -Group "Users" -Member $UserName
+
+  DeadlineWorkerRecipe:
+    Type: AWS::ImageBuilder::ImageRecipe
+    Properties:
+      Name: !Sub "${NamePrefix}-deadline-cmf-recipe"
+      Version: 1.0.0
+      Components:
+        - ComponentArn: !Ref PythonComponentWindows
+        - ComponentArn: !Ref DeadlineComponentWindows
+        - ComponentArn: !Ref DeadlineConfigComponentWindows
+        - ComponentArn: !Ref CreateRenderUserComponentWindows
+      ParentImage: !Sub 'arn:aws:imagebuilder:${AWS::Region}:aws:image/windows-server-2022-english-full-base-x86/2024.10.9'
+      WorkingDirectory: /tmp
+
+  DeadlineWorkerDistribution:
+    Type: AWS::ImageBuilder::DistributionConfiguration
+    Properties:
+      Name: !Sub ${NamePrefix}deadline-cmf-distribution
+      Distributions:
+        - Region: !Ref AWS::Region
+          AmiDistributionConfiguration:
+            Name: !Sub ${NamePrefix}-deadline-cmf-worker-{{imagebuilder:buildDate}}
+            TargetAccountIds:
+              - !Ref AWS::AccountId
+
+  DeadlineWorkerPipeline:
+    Type: AWS::ImageBuilder::ImagePipeline
+    Properties:
+      Name: !Sub ${NamePrefix}-deadline-cmf-pipeline
+      ImageRecipeArn: !Ref DeadlineWorkerRecipe
+      InfrastructureConfigurationArn: !Ref DeadlineWorkerInfraConfig
+      DistributionConfigurationArn: !Ref DeadlineWorkerDistribution
+      EnhancedImageMetadataEnabled: true
+      ImageTestsConfiguration:
+        ImageTestsEnabled: true
+        TimeoutMinutes: 60
+
+  DeadlineWorkerImage:
+    Type: AWS::ImageBuilder::Image
+    Properties:
+      ImageRecipeArn: !Ref DeadlineWorkerRecipe
+      InfrastructureConfigurationArn: !Ref DeadlineWorkerInfraConfig
+      DistributionConfigurationArn: !Ref DeadlineWorkerDistribution
+      EnhancedImageMetadataEnabled: true
+      ImageTestsConfiguration:
+        ImageTestsEnabled: true
+        TimeoutMinutes: 60
+
+Outputs:
+  ImageId:
+    Description: "The AMI ID of the created image"
+    Value: !GetAtt DeadlineWorkerImage.ImageId
+  RenderUserPasswordSecret:
+    Description: "The secret containing the password for the render job user"
+    Value: !Ref GeneratedPassword

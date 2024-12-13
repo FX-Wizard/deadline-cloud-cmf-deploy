@@ -1,0 +1,181 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Create Deadline Cloud worker image for customer managed fleet (CMF) using imagebuilder.
+
+Parameters:
+  NamePrefix:
+    Type: String
+    Description: A prefix for naming resources
+    AllowedPattern: ^[a-zA-Z0-9][a-zA-Z0-9-_]*[a-zA-Z0-9]$
+    MinLength: 2
+    MaxLength: 64
+    ConstraintDescription: Name prefix must start and end with alphanumeric characters and contain only letters, numbers, hyphens (-), and underscores (_)
+  FarmId:
+    Type: String
+    Description: ID of the render farm.
+  InstanceTypes:
+    Type: CommaDelimitedList
+    Description: "A comma separated list of instance types to be used by Image Builder to create the image. For example: 'g4dn.xlarge,m5a.large'"
+    Default: "c6a.xlarge,c6.xlarge"
+  Vpc:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC to launch the Image Builder instance in.
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Subnets to run Deadline Worker instance.
+  SecurityGroupIds:
+    Type: List<AWS::EC2::SecurityGroup::Id>
+    Description: Security group with the required inbound and outbound rules to allow Image Builder to access resources in the VPC
+  OperatingSystem:
+    Type: String
+    Description: The operating system of the render farm.
+    Default: "LINUX"
+    AllowedValues:
+      - "LINUX"
+      - "WINDOWS"
+  MaxWorkerCount:
+    Type: Number
+    Description: The maximum number of workers in the fleet.
+    Default: 10
+    MinValue: 1
+  BucketName:
+    Type: String
+    Description: Select an S3 bucket to store render assets. Leave empty to create a new bucket.
+    Default: ""
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Basic Settings"
+        Parameters:
+          - NamePrefix
+      - Label:
+          default: "Render Farm Settings"
+        Parameters:
+          - FarmId
+          - BucketName
+      - Label:
+          default: "Render Worker Settings"
+        Parameters:
+          - Vpc
+          - SubnetIds
+          - SecurityGroupIds
+          - InstanceTypes
+          - OperatingSystem
+          - MaxWorkerCount
+    ParameterLabels:
+      NamePrefix:
+        default: "Name prefix"
+      FarmId:
+        default: "Render farm ID"
+      Vpc:
+        default: "VPC (Virtual Private Cloud)"
+      SubnetIds:
+        default: "Subnet IDs"
+      SecurityGroupIds:
+        default: "Security group IDs"
+      InstanceTypes:
+        default: "Instance types"
+      OperatingSystem:
+        default: "Operating system"
+      MaxWorkerCount:
+        default: "Maximum worker count"
+      BucketName:
+        default: "S3 bucket name"
+
+Conditions:
+  IsWindows: !Equals [ !Ref OperatingSystem, "WINDOWS"]
+  IsLinux: !Equals [ !Ref OperatingSystem, "LINUX"]
+
+Resources:
+  FleetStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: https://s3.ap-southeast-2.amazonaws.com/dodgy-bros-cf-templates/DeadlineCMFFleetStack.yml
+      Parameters:
+        NamePrefix: !Ref NamePrefix
+        FarmId: !Ref FarmId
+        OperatingSystem: !Ref OperatingSystem
+        MaxWorkerCount: !Ref MaxWorkerCount
+      Tags:
+        - Key: Name
+          Value: !Sub "${NamePrefix}-FleetStack"
+
+  RenderWorkerImageWindowsStack:
+    Type: AWS::CloudFormation::Stack
+    Condition: IsWindows
+    Properties:
+      TemplateURL: https://s3.ap-southeast-2.amazonaws.com/dodgy-bros-cf-templates/CmfWindowsImageBuilder.yml
+      Parameters:
+        NamePrefix: !Ref NamePrefix
+        FarmId: !Ref FarmId
+        FleetId: !GetAtt FleetStack.Outputs.FleetId
+        InstanceTypes: !Join [",", !Ref InstanceTypes]
+        Vpc: !Ref Vpc
+        SubnetIds: !Join [",", !Ref SubnetIds]
+        SecurityGroupIds: !Join [",", !Ref SecurityGroupIds]
+      Tags:
+        - Key: Name
+          Value: !Sub "${NamePrefix}-RenderWorkerImageBuilder"
+
+  RenderWorkerImageLinuxStack:
+    Type: AWS::CloudFormation::Stack
+    Condition: IsLinux
+    Properties:
+      TemplateURL: https://s3.ap-southeast-2.amazonaws.com/dodgy-bros-cf-templates/CmfLinuxImageBuilder.yml
+      Parameters:
+        NamePrefix: !Ref NamePrefix
+        FarmId: !Ref FarmId
+        FleetId: !GetAtt FleetStack.Outputs.FleetId
+        InstanceTypes: !Join [",", !Ref InstanceTypes]
+        Vpc: !Ref Vpc
+        SubnetIds: !Join [",", !Ref SubnetIds]
+        SecurityGroupIds: !Join [",", !Ref SecurityGroupIds]
+      Tags:
+        - Key: Name
+          Value: !Sub "${NamePrefix}-RenderWorkerImageBuilder"
+
+  QueueStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: https://s3.ap-southeast-2.amazonaws.com/dodgy-bros-cf-templates/DeadlineCloudQueue.yml
+      Parameters:
+        NamePrefix: !Ref NamePrefix
+        FarmId: !Ref FarmId
+        FleetId: !GetAtt FleetStack.Outputs.FleetId
+        PasswordSecretArn: !If 
+          - IsWindows
+          - !GetAtt RenderWorkerImageWindowsStack.Outputs.RenderUserPasswordSecret
+          - !GetAtt RenderWorkerImageLinuxStack.Outputs.RenderUserPasswordSecret
+        BucketName: !Ref BucketName
+      Tags:
+        - Key: Name
+          Value: !Sub "${NamePrefix}-QueueStack"
+
+  AutoScaleStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: https://s3.ap-southeast-2.amazonaws.com/dodgy-bros-cf-templates/DeadlineCMFAutoscale.yml
+      Parameters:
+        NamePrefix: !Ref NamePrefix
+        FleetId: !GetAtt FleetStack.Outputs.FleetId
+        MaxWorkerCount: !Ref MaxWorkerCount
+        AMIId: !If 
+          - IsWindows
+          - !GetAtt RenderWorkerImageWindowsStack.Outputs.ImageId
+          - !GetAtt RenderWorkerImageLinuxStack.Outputs.ImageId
+        Vpc: !Ref Vpc
+        SubnetIds: !Join [",", !Ref SubnetIds]
+        SecurityGroupIds: !Join [",", !Ref SecurityGroupIds]
+      Tags:
+        - Key: Name
+          Value: !Sub "${NamePrefix}-AutoScaleStack"
+
+  EventInfraStack:
+    Type: AWS::CloudFormation::Stack
+    DependsOn: AutoScaleStack
+    Properties:
+      TemplateURL: https://s3.ap-southeast-2.amazonaws.com/dodgy-bros-cf-templates/DeadlineEventInfraStack.yml
+      Tags:
+        - Key: Name
+          Value: !Sub "${NamePrefix}-EventInfraStack"

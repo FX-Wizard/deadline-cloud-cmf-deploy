@@ -1,0 +1,124 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: Deadline Cloud autoscaling infrastructure for customer-managed fleet
+
+Parameters:
+  NamePrefix:
+    Type: String
+    Description: A prefix for naming resources
+  FleetId:
+    Type: String
+    Description: Fleet ID
+  MaxWorkerCount:
+    Type: Number
+    Description: The maximum number of workers in the fleet.
+    Default: 10
+    MinValue: 1
+  AMIId:
+    Type: String
+    Description: AMI ID for launching workers
+  Vpc:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC to launch Deadline Worker in.
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Subnets to launch Deadline Workers in.
+  SecurityGroupIds:
+    Type: List<AWS::EC2::SecurityGroup::Id>
+    Description: Security Groups to assign to render workers
+
+Resources:
+  deadlineInstanceAccessAccessRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      RoleName: !Sub "${NamePrefix}-Deadline-Instance-Access-Role"
+      AssumeRolePolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action:
+              - 'sts:AssumeRole'
+      Path: /     
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy'
+        - 'arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore'
+        - 'arn:aws:iam::aws:policy/AWSDeadlineCloud-WorkerHost'
+
+  deadlineInstanceProfile:
+    Type: 'AWS::IAM::InstanceProfile'
+    Properties:
+      Path: /
+      Roles:
+        - !Ref deadlineInstanceAccessAccessRole
+
+  deadlineLaunchTemplate:
+    Type: 'AWS::EC2::LaunchTemplate'
+    Properties:
+      LaunchTemplateName: !Sub "${NamePrefix}-Deadline-Launch-Template"
+      LaunchTemplateData:
+        NetworkInterfaces:
+          - DeviceIndex: 0
+            AssociatePublicIpAddress: true
+            Groups: !Ref SecurityGroupIds
+            DeleteOnTermination: true
+        ImageId: !Ref AMIId
+        InstanceInitiatedShutdownBehavior: terminate
+        IamInstanceProfile:
+          Arn: !GetAtt
+            - deadlineInstanceProfile
+            - Arn
+        MetadataOptions:
+          HttpTokens: required
+          HttpEndpoint: enabled
+
+  deadlineAutoScalingGroup:
+    Type: 'AWS::AutoScaling::AutoScalingGroup'
+    Properties:
+      AutoScalingGroupName: !Sub "deadline-ASG-autoscalable-${FleetId}" # Must be this name or the lambda trigger won't find the ASG
+      MinSize: 0
+      MaxSize: !Ref MaxWorkerCount
+      VPCZoneIdentifier: !Ref SubnetIds
+      NewInstancesProtectedFromScaleIn: true
+      MixedInstancesPolicy:
+        InstancesDistribution:
+          OnDemandBaseCapacity: 0
+          OnDemandPercentageAboveBaseCapacity: 0
+          SpotAllocationStrategy: capacity-optimized
+          OnDemandAllocationStrategy: lowest-price
+        LaunchTemplate:
+          LaunchTemplateSpecification:
+            LaunchTemplateId: !Ref deadlineLaunchTemplate
+            Version: !GetAtt
+              - deadlineLaunchTemplate
+              - LatestVersionNumber
+          Overrides:
+            - InstanceType: m5.large
+            - InstanceType: m5d.large
+            - InstanceType: m5a.large
+            - InstanceType: m5ad.large
+            - InstanceType: m5n.large
+            - InstanceType: m5dn.large
+            - InstanceType: m4.large
+            - InstanceType: m3.large
+            - InstanceType: r5.large
+            - InstanceType: r5d.large
+            - InstanceType: r5a.large
+            - InstanceType: r5ad.large
+            - InstanceType: r5n.large
+            - InstanceType: r5dn.large
+            - InstanceType: r4.large
+      MetricsCollection:
+        - Granularity: 1Minute
+          Metrics:
+            - GroupMinSize
+            - GroupMaxSize
+            - GroupDesiredCapacity
+            - GroupInServiceInstances
+            - GroupTotalInstances
+            - GroupInServiceCapacity
+            - GroupTotalCapacity
+
+Outputs:
+   DeadlineASGId:
+    Description: "Deadline Worker Auto Scaling Group ID"
+    Value: !Ref deadlineAutoScalingGroup

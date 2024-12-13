@@ -1,0 +1,96 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Create Deadline Cloud queue for customer managed fleet (CMF).
+
+Parameters:
+  NamePrefix:
+    Type: String
+    Description: A prefix for naming resources
+    AllowedPattern: ^[a-zA-Z0-9][a-zA-Z0-9-_]*[a-zA-Z0-9]$
+    MinLength: 1
+    MaxLength: 64
+    ConstraintDescription: Name prefix must start and end with alphanumeric characters and contain only letters, numbers, hyphens (-), and underscores (_)
+  FarmId:
+    Type: String
+    Description: ID of the render farm.
+  FleetId:
+    Type: String
+    Description: ID of the Deadline customer managed fleet.
+  BucketName:
+    Type: String
+    Description: Select an S3 bucket to store render assets. Leave empty to create a new bucket.
+    Default: ""
+  PasswordSecretArn:
+    Type: String
+    Description: ARN of the Secrets Manager secret containing the admin password for the Deadline worker user.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Basic Settings"
+        Parameters:
+          - NamePrefix
+      - Label:
+          default: "S3 Settings"
+        Parameters:
+          - BucketName
+      - Label:
+          default: "Deadline Settings"
+        Parameters:
+          - FarmId
+          - FleetId
+          - PasswordSecretArn
+
+Conditions:
+  BucketNameIsEmpty: !Equals 
+    - !Ref BucketName
+    - ""
+
+Resources:
+  RenderAssetsBucket:
+    Type: AWS::S3::Bucket
+    Condition: BucketNameIsEmpty
+    Properties:
+      BucketName: !Sub "${NamePrefix}-deadline-render-assets-${AWS::AccountId}-${AWS::Region}"
+      AccessControl: BucketOwnerFullControl
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteAfter30Days
+            Status: Enabled
+            ExpirationInDays: 30
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  DeadlineCMFQueue:
+    Type: AWS::Deadline::Queue
+    Properties:
+      DisplayName: !Sub "${NamePrefix}-Queue"
+      Description: !Sub "Queue for ${NamePrefix} customer managed fleet"
+      FarmId: !Ref FarmId
+      JobAttachmentSettings:
+        S3BucketName: !Ref BucketName
+        RootPrefix: "/"
+      JobRunAsUser:
+        Posix: 
+          User: renderuser
+          Group: renderuser
+        Windows:
+          User: renderuser
+          PasswordArn: !Ref PasswordSecretArn
+        RunAs: QUEUE_CONFIGURED_USER
+
+  QueueAssociation:
+    Type: AWS::Deadline::QueueFleetAssociation
+    Properties:
+      FarmId: !Ref FarmId
+      FleetId: !Ref FleetId
+      QueueId: !GetAtt DeadlineCMFQueue.QueueId
+
+Outputs:
+  QueueId:
+    Value: !GetAtt DeadlineCMFQueue.QueueId

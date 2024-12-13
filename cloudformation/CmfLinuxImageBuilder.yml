@@ -1,0 +1,459 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Create Deadline Cloud worker image for customer managed fleet (CMF) using imagebuilder.
+
+Parameters:
+  NamePrefix:
+    Type: String
+    Description: A prefix for naming resources
+    AllowedPattern: ^[a-zA-Z0-9][a-zA-Z0-9-_]*[a-zA-Z0-9]$
+    MinLength: 1
+    MaxLength: 64
+    ConstraintDescription: Name prefix must start and end with alphanumeric
+      characters and contain only letters, numbers, hyphens (-), and underscores
+      (_)
+  FarmId:
+    Type: String
+    Description: ID of the render farm.
+  FleetId:
+    Type: String
+    Description: ID of the Deadline customer managed fleet.
+  InstanceTypes:
+    Type: CommaDelimitedList
+    Description: "A comma separated list of instance types to be used by Image Builder to create the image. For example: 'g4dn.xlarge,m5a.large'"
+    Default: c6a.xlarge,c6.xlarge
+  Vpc:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC to launch the Image Builder instance in.
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Subnet to run Image Builder instance.
+  SecurityGroupIds:
+    Type: List<AWS::EC2::SecurityGroup::Id>
+    Description: Security group with the required inbound and outbound rules to
+      allow Image Builder to access resources in the VPC
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Basic Settings"
+        Parameters:
+          - NamePrefix
+      - Label:
+          default: "Render Farm Settings"
+        Parameters:
+          - FarmId
+          - FleetId
+      - Label:
+          default: "Image Builder Settings"
+        Parameters:
+          - Vpc
+          - Subnet
+          - SecurityGroup
+          - InstanceTypes
+    ParameterLabels:
+      NamePrefix:
+        default: "Name Prefix"
+      FarmId:
+        default: "Render Farm ID"
+      FleetId:
+        default: "Fleet ID"
+      InstanceTypes:
+        default: "Instance Types"
+      Vpc:
+        default: "VPC"
+      Subnet:
+        default: "Subnet"
+      SecurityGroup:
+        default: "Security Group"
+
+Resources:
+  ImageBuilderRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - arn:aws:iam::aws:policy/EC2InstanceProfileForImageBuilder
+
+  ImageBuilderInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub ${NamePrefix}-ImageBuilderInstanceProfile
+      Roles:
+        - !Ref ImageBuilderRole
+
+  DeadlineWorkerInfraConfig:
+    Type: AWS::ImageBuilder::InfrastructureConfiguration
+    Properties:
+      Name: !Sub ${NamePrefix}-deadline-cmf-infra-config
+      InstanceTypes: !Ref InstanceTypes
+      InstanceProfileName: !Ref ImageBuilderInstanceProfile
+      SubnetId: !Select [0, !Ref SubnetIds]
+      SecurityGroupIds: !Ref SecurityGroupIds
+      TerminateInstanceOnFailure: true
+
+
+  PythonComponentLinux:
+    Type: AWS::ImageBuilder::Component
+    Properties:
+      Name: python-component-linux
+      Platform: Linux
+      Version: 1.0.0
+      Data: |
+        name: Python Component
+        description: Installs Python 3
+        schemaVersion: 1.0
+        phases:
+          - name: build
+            steps:
+              - name: InstallPython
+                action: ExecuteBash
+                inputs:
+                  commands:
+                    - |
+                      # Install Python
+                      sudo dnf install python3.11
+                      sudo dnf install python3.11-pip
+
+                      # Link python version to system default
+                      sudo rm /usr/bin/python
+                      sudo ln -s /usr/bin/python3.11 /usr/bin/python
+
+                      # Test installation
+                      python --version
+                      if [ $? -ne 0 ]; then
+                          echo "Python is not installed or not in PATH"
+                          exit 1
+                      fi
+
+  DeadlineComponentLinux:
+    Type: AWS::ImageBuilder::Component
+    Properties:
+      Name: deadline-installation-linux
+      Platform: Linux
+      Version: 1.0.0
+      Data: |
+        name: Deadline Installation Component
+        description: Installs Deadline Worker
+        schemaVersion: 1.0
+        phases:
+          - name: build
+            steps:
+              - name: DownloadAndInstallDeadline
+                action: ExecuteBash
+                inputs:
+                  commands:
+                    - python -m pip install deadline-cloud-worker-agent
+
+  DeadlineConfigComponentLinux:
+    Type: AWS::ImageBuilder::Component
+    Properties:
+      Name: deadline-config
+      Platform: Linux
+      Version: 1.0.0
+      Data: !Sub |
+        name: Deadline Config Component
+        description: Configures Deadline Worker
+        schemaVersion: 1.0
+        phases:
+          - name: build
+            steps:
+              - name: ConfigureDeadline
+                action: ExecuteBash
+                inputs:
+                  commands:
+                    - |
+                      install-deadline-worker \
+                        --farm-id ${FarmId} \
+                        --fleet-id ${FleetId} \
+                        --region ${AWS::Region} \
+                        --allow-shutdown \
+                        --yes
+
+  AwsCliComponentLinux:
+    Type: AWS::ImageBuilder::Component
+    Properties:
+      Name: awscli-installation-linux
+      Platform: Linux
+      Version: 1.0.0
+      Data: |
+        name: AWS CLI Installation Component
+        description: Installs AWS CLI version 2
+        schemaVersion: 1.0
+        phases:
+          - name: build
+            steps:
+              - name: InstallAwsCli
+                action: ExecuteBash
+                inputs:
+                  commands:
+                    - |
+                      # Install required dependencies
+                      sudo dnf install -y unzip
+                      
+                      # Download and install AWS CLI
+                      mkdir -p /tmp/awscli
+                      cd /tmp/awscli
+                      curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+                      unzip awscliv2.zip
+                      sudo ./aws/install
+                      
+                      # Clean up installation files
+                      cd ~
+                      rm -rf /tmp/awscli
+                      
+                      # Verify installation
+                      aws --version
+                      if [ $? -ne 0 ]; then
+                        echo "AWS CLI installation failed"
+                        exit 1
+                      fi
+
+  GeneratedPassword:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub ${NamePrefix}-render-user-password
+      Description: Password for render job user
+      GenerateSecretString:
+        PasswordLength: 20
+        ExcludeCharacters: '"@/\\' # Exclude problematic characters
+        ExcludePunctuation: true
+        RequireEachIncludedType: true # Require all character types
+        IncludeSpace: false
+        SecretStringTemplate: '{"username": "renderuser"}' # Include additional fields
+        GenerateStringKey: password # Key name for the generated password
+
+  CreateRenderUserComponentLinux:
+    Type: AWS::ImageBuilder::Component
+    Properties:
+      Name: render-job-user
+      Platform: Linux
+      Version: 1.0.0
+      Data: !Sub |
+        name: Create Render Job User
+        description: Creates new user account for Deadline Cloud to run render jobs as
+        schemaVersion: 1.0
+        phases:
+          - name: build
+            steps:
+              - name: ConfigureDeadline
+                action: ExecuteBash
+                inputs:
+                  commands:
+                    - |
+                      # Create the renderuser account
+                      USERNAME="renderuser"
+
+                      # Get password from Secrets Manager
+                      PASSWORD=$(aws secretsmanager get-secret-value --secret-id ${GeneratedPassword} --query 'SecretString' --output text | jq -r '.password')
+
+                      # Create user with home directory
+                      useradd -m $USERNAME
+
+                      # Set the password
+                      echo "$USERNAME:$PASSWORD" | chpasswd
+
+                      # Ensure password doesn't expire
+                      chage -M -1 $USERNAME
+
+                      # Add user to necessary groups (adjust groups as needed)
+                      usermod -aG users $USERNAME
+                      
+                      # Verify user creation
+                      if id "$USERNAME" >/dev/null 2>&1; then
+                        echo "User $USERNAME created successfully"
+                      else
+                        echo "Failed to create user $USERNAME"
+                        exit 1
+                      fi
+
+  BlenderComponentLinux:
+    Type: AWS::ImageBuilder::Component
+    Properties:
+      Name: blender-installation-linux
+      Platform: Linux
+      Version: 1.0.0
+      Data: |
+        name: Blender Installation Component
+        description: Installs Blender on Rocky Linux 9
+        schemaVersion: 1.0
+        phases:
+          - name: build
+            steps:
+              - name: InstallDependencies
+                action: ExecuteBash
+                inputs:
+                  commands:
+                    - |
+                      # Install EPEL repository
+                      sudo dnf install -y epel-release
+                      # Install required dependencies
+                      sudo dnf install -y \
+                        mesa-libGL \
+                        mesa-libGLU \
+                        libXi \
+                        libXrender \
+                        xorg-x11-server-Xvfb \
+                        libXfixes \
+                        libXcursor \
+                        libXrandr \
+                        libXinerama \
+                        libpng \
+                        libtiff \
+                        libjpeg-turbo \
+                        openexr \
+                        python3-numpy \
+                        zlib \
+                        openssl \
+                        libgomp \
+                        glibc \
+                        libstdc++ \
+                        libxkbcommon
+              - name: DownloadAndInstallBlender
+                action: ExecuteBash
+                inputs:
+                  commands:
+                    - |
+                      # Create installation directory
+                      sudo mkdir -p /opt/blender
+                      cd /opt/blender
+                      sudo chown $USER: /opt/blender
+                      # Download Blender (adjust version as needed)
+                      BLENDER_VERSION="4.2"
+                      BLENDER_FULL_VERSION="4.2.4"
+                      curl -O https://download.blender.org/release/Blender${BLENDER_VERSION}/blender-${BLENDER_FULL_VERSION}-linux-x64.tar.xz
+                      # Extract Blender
+                      tar -xf blender-${BLENDER_FULL_VERSION}-linux-x64.tar.xz
+                      rm blender-${BLENDER_FULL_VERSION}-linux-x64.tar.xz
+                      # Move Blender files to final location
+                      sudo mv blender-${BLENDER_FULL_VERSION}-linux-x64/* .
+                      sudo rmdir blender-${BLENDER_FULL_VERSION}-linux-x64
+                      # Create symbolic link
+                      sudo ln -s /opt/blender/blender /usr/local/bin/blender
+                      # Set permissions
+                      sudo chmod 755 /usr/local/bin/blender
+              - name: VerifyInstallation
+                action: ExecuteBash
+                inputs:
+                  commands:
+                    - |
+                      # Test Blender installation
+                      blender_version=$(blender --version)
+                      if [ $? -ne 0 ]; then
+                        echo "Blender installation failed"
+                        exit 1
+                      fi
+                      echo "Blender version: $blender_version"
+                      # Test Blender can run in headless mode
+                      xvfb-run blender -b -v
+                      if [ $? -ne 0 ]; then
+                        echo "Blender headless mode test failed"
+                        exit 1
+                      fi
+                      echo "Blender headless mode test successful"
+
+  DeadlineAdaptorBlenderInstallComponent:
+    Type: AWS::ImageBuilder::Component
+    Properties:
+      Name: deadline-adaptor-blender-install-component
+      Platform: Linux
+      Version: 1.0.0
+      Data: !Sub |
+        name: Deadline Adaptor Blender Install Component
+        description: Installs Deadline Adaptor for Blender
+        schemaVersion: 1.0
+        phases:
+          - name: build
+            steps:
+              - name: InstallDeadlineAdaptorBlender
+                action: ExecuteBash
+                inputs:
+                  commands:
+                    - python -m pip install deadline-cloud-for-blender
+
+  RetainSSMAgentComponent:
+    Type: AWS::ImageBuilder::Component
+    Properties:
+      Name: retain-ssm-agent-component
+      Platform: Linux
+      Version: 1.0.0
+      Data: !Sub |
+        name: Retain SSM Agent Component
+        description: Retains SSM Agent
+        schemaVersion: 1.0
+        phases:
+          - name: build
+            steps:
+              - name: RetainSSMAgent
+                action: ExecuteBash
+                inputs:
+                  commands:
+                    - |
+                      # Remove temp file so SSM thinks it was already removed
+                      sudo rm -rf /tmp/imagebuilder_service/ssm_installed
+
+  DeadlineWorkerRecipe:
+    Type: AWS::ImageBuilder::ImageRecipe
+    Properties:
+      Name: !Sub "${NamePrefix}-deadline-cmf-recipe"
+      Version: 1.0.0
+      Components:
+        - ComponentArn: !Ref PythonComponentLinux
+        - ComponentArn: !Ref DeadlineComponentLinux
+        - ComponentArn: !Ref DeadlineConfigComponentLinux
+        - ComponentArn: !Ref AwsCliComponentLinux
+        - ComponentArn: !Ref CreateRenderUserComponentLinux
+        - ComponentArn: !Ref BlenderComponentLinux
+        - ComponentArn: !Ref DeadlineAdaptorBlenderInstallComponent
+        - ComponentArn: !Ref RetainSSMAgentComponent
+      ParentImage: !Sub arn:aws:imagebuilder:${AWS::Region}:aws:image/rocky-linux-9-x86/latest
+      WorkingDirectory: /tmp
+
+  DeadlineWorkerDistribution:
+    Type: AWS::ImageBuilder::DistributionConfiguration
+    Properties:
+      Name: !Sub ${NamePrefix}-deadline-cmf-distribution
+      Distributions:
+        - Region: !Ref AWS::Region
+          AmiDistributionConfiguration:
+            Name: !Sub ${NamePrefix}-deadline-cmf-worker-{{imagebuilder:buildDate}}
+            TargetAccountIds:
+              - !Ref AWS::AccountId
+
+  DeadlineWorkerPipeline:
+    Type: AWS::ImageBuilder::ImagePipeline
+    Properties:
+      Name: !Sub "${NamePrefix}-deadline-cmf-pipeline"
+      ImageRecipeArn: !Ref DeadlineWorkerRecipe
+      InfrastructureConfigurationArn: !Ref DeadlineWorkerInfraConfig
+      DistributionConfigurationArn: !Ref DeadlineWorkerDistribution
+      EnhancedImageMetadataEnabled: true
+      ImageTestsConfiguration:
+        ImageTestsEnabled: true
+        TimeoutMinutes: 60
+
+  DeadlineWorkerImage:
+    Type: AWS::ImageBuilder::Image
+    Properties:
+      ImageRecipeArn: !Ref DeadlineWorkerRecipe
+      InfrastructureConfigurationArn: !Ref DeadlineWorkerInfraConfig
+      DistributionConfigurationArn: !Ref DeadlineWorkerDistribution
+      EnhancedImageMetadataEnabled: true
+      ImageTestsConfiguration:
+        ImageTestsEnabled: true
+        TimeoutMinutes: 60
+
+Outputs:
+  ImageId:
+    Description: The AMI ID of the created image
+    Value: !GetAtt DeadlineWorkerImage.ImageId
+  RenderUserPasswordSecret:
+    Description: The secret containing the password for the render job user
+    Value: !Ref GeneratedPassword
